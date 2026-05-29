@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-pi",
+	"name": "Pi",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "Chat with the Pi coding agent inside Obsidian. Create, edit, and organize your notes through natural conversation.",
+	"author": "Gabriel Rivera",
+	"authorUrl": "https://github.com/grivera82",
+	"isDesktopOnly": true
+}
