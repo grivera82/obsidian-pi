@@ -94,6 +94,7 @@ export interface PiConnectionOptions {
 	apiKeys?: Record<string, string>;
 	extraArgs?: string[];
 	timeout?: number;
+	ttyEmulation?: boolean; // wrap with script for pseudo-TTY
 }
 
 export class PiConnection {
@@ -146,10 +147,14 @@ export class PiConnection {
 			"XDG_CONFIG_HOME",
 			"XDG_DATA_HOME",
 			"XDG_CACHE_HOME",
+			"XDG_STATE_HOME",
 			"TMPDIR",
 			"LANG",
 			"LC_ALL",
 			"LC_CTYPE",
+			// Pi-specific / package-related
+			"PI_HOME",
+			"PI_CONFIG_DIR",
 		];
 
 		for (const key of coreVars) {
@@ -194,15 +199,76 @@ export class PiConnection {
 		// Apply enhanced PATH (critical on macOS for Homebrew / nvm)
 		env.PATH = enhancedPath;
 
+		// Debug: log which auth-related variables we detected (without exposing secrets)
+		const detectedAuthKeys = Object.keys(env).filter(k =>
+			k.includes("API_KEY") ||
+			k.includes("TOKEN") ||
+			k.startsWith("PI_") ||
+			k.startsWith("XAI_") ||
+			k.startsWith("GROK_")
+		);
+		if (detectedAuthKeys.length > 0) {
+			console.log("[Pi RPC] Detected auth-related env keys:", detectedAuthKeys);
+		} else {
+			console.warn("[Pi RPC] No common auth-related environment variables were detected. Custom Pi auth plugins may not work.");
+		}
+
+		// Build the final command for logging
+		const finalArgs = ["--mode", "rpc", ...(this.options.extraArgs || [])];
+		const commandStr = `${this.options.piBinaryPath} ${finalArgs.join(" ")}`;
+
 		// Highest priority: any keys the user explicitly configured in plugin settings
 		// (these can override the auto-detected ones)
+		const explicitKeys: string[] = [];
 		for (const [key, value] of Object.entries(this.options.apiKeys || {})) {
 			if (value?.trim()) {
+				env[key] = value;
+				explicitKeys.push(key);
+			}
+		}
+		if (explicitKeys.length > 0) {
+			console.log("[Pi RPC] Injected explicit keys from plugin settings:", explicitKeys.join(", "));
+			this.dispatch({
+				type: "spawn_info",
+				note: `Explicit keys from Obsidian settings injected: ${explicitKeys.join(", ")}`,
+			});
+		}
+
+		// Pass through any PI_* environment variables (many Pi packages and auth plugins use these)
+		for (const [key, value] of Object.entries(process.env)) {
+			if (key.startsWith("PI_") && value) {
 				env[key] = value;
 			}
 		}
 
-		this.process = spawn(this.options.piBinaryPath, ["--mode", "rpc", ...(this.options.extraArgs || [])], {
+		console.log("[Pi RPC] Spawning:", commandStr);
+		console.log("[Pi RPC] Working directory:", this.options.cwd);
+
+		// Send spawn info to the debug panel
+		this.dispatch({
+			type: "spawn_info",
+			command: commandStr,
+			cwd: this.options.cwd,
+			detectedAuthKeys,
+		});
+
+		let spawnCommand = this.options.piBinaryPath;
+		let spawnArgs = [...finalArgs];
+
+		// TTY emulation on macOS using `script`
+		if (this.options.ttyEmulation && process.platform === "darwin") {
+			spawnCommand = "script";
+			spawnArgs = ["-q", "/dev/null", this.options.piBinaryPath, ...finalArgs];
+			console.log("[Pi RPC] Using TTY emulation via script");
+			this.dispatch({
+				type: "spawn_info",
+				command: `script -q /dev/null ${this.options.piBinaryPath} ${finalArgs.join(" ")}`,
+				cwd: this.options.cwd,
+				note: "TTY emulation enabled",
+			});
+		}
+
+		this.process = spawn(spawnCommand, spawnArgs, {
 			cwd: this.options.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			env,
@@ -227,9 +293,10 @@ export class PiConnection {
 					const event = JSON.parse(trimmed) as RpcEvent;
 					this.dispatch(event);
 				} catch {
-					// Non-JSON debug output from Pi
+					// Non-JSON debug output from Pi (can be very useful with --verbose)
 					if (!trimmed.startsWith("{")) {
-						console.debug("[Pi RPC] non-JSON:", trimmed);
+						console.debug("[Pi RPC] non-JSON stdout:", trimmed);
+						this.dispatch({ type: "stderr", line: `[stdout] ${trimmed}` });
 					}
 				}
 			});
@@ -339,6 +406,32 @@ export class PiConnection {
 
 	isConnected(): boolean {
 		return this.connected;
+	}
+
+	/**
+	 * Convenience method: Ask Pi what models/providers are available.
+	 * Very useful for debugging custom auth packages like pi-xai-oauth.
+	 */
+	async getAvailableModels(): Promise<RpcEvent> {
+		return this.send({ type: "get_available_models" });
+	}
+
+	/**
+	 * Convenience method: Get current session state (including current model/provider).
+	 */
+	async getState(): Promise<RpcEvent> {
+		return this.send({ type: "get_state" });
+	}
+
+	/**
+	 * Set the active model/provider.
+	 * Example: setModel("grok-build", "grok-4.3") or setModel(undefined, "grok-4.3")
+	 */
+	async setModel(provider?: string, modelId?: string): Promise<RpcEvent> {
+		const cmd: Record<string, unknown> = { type: "set_model" };
+		if (provider) cmd.provider = provider;
+		if (modelId) cmd.modelId = modelId;
+		return this.send(cmd);
 	}
 
 	private dispatch(event: RpcEvent): void {

@@ -20,11 +20,17 @@ export class PiChatView extends ItemView {
 	private sendBtn!: HTMLButtonElement;
 	private abortBtn!: HTMLButtonElement;
 	private statusEl!: HTMLElement;
+	private modelEl!: HTMLElement;
 
 	// Debug panel
 	private debugContainer!: HTMLElement;
 	private debugContent!: HTMLElement;
 	private debugLogs: string[] = [];
+
+	// Model state
+	private availableModels: Array<{ id: string; provider?: string; name?: string }> = [];
+	private currentModel: string = "";
+	private currentProvider: string = "";
 
 	private messages: ChatMessage[] = [];
 	private isStreaming = false;
@@ -56,6 +62,11 @@ export class PiChatView extends ItemView {
 		// Header
 		const header = this.contentEl.createDiv({ cls: "pi-chat-header" });
 		header.createEl("h3", { text: "Pi", cls: "pi-chat-title" });
+
+		// Current model display (clickable)
+		this.modelEl = header.createDiv({ cls: "pi-chat-model", text: "No model" });
+		this.modelEl.onclick = () => this.showModelSwitcher();
+
 		this.statusEl = header.createDiv({ cls: "pi-chat-status", text: "Disconnected" });
 
 		// Messages container
@@ -155,6 +166,37 @@ export class PiChatView extends ItemView {
 		this.logDebug(`[status] ${text}`);
 	}
 
+	private updateModelDisplay() {
+		if (this.modelEl) {
+			const display = this.currentProvider 
+				? `${this.currentProvider} / ${this.currentModel || "?"}`
+				: (this.currentModel || "No model");
+			this.modelEl.setText(display);
+			this.modelEl.title = "Click to switch model";
+		}
+	}
+
+	private async showModelSwitcher() {
+		if (!this.connection || this.availableModels.length === 0) {
+			new Notice("No models available yet. Wait for connection or send a message first.");
+			return;
+		}
+
+		// Simple model switcher using prompts for now (can be improved later)
+		const options = this.availableModels.map(m => ({
+			label: m.provider ? `${m.provider} / ${m.id}` : m.id,
+			value: m
+		}));
+
+		// For a quick implementation, we'll use a basic approach:
+		// Show a notice with instructions + add a proper command for switching.
+		const current = this.currentProvider 
+			? `${this.currentProvider}/${this.currentModel}` 
+			: this.currentModel;
+
+		new Notice(`Current: ${current}\nUse Command Palette → "Pi: Switch model" to change.`, 6000);
+	}
+
 	private logDebug(message: string, isError = false) {
 		const time = new Date().toLocaleTimeString();
 		const prefix = isError ? "❌ " : "";
@@ -180,11 +222,104 @@ export class PiChatView extends ItemView {
 
 	private ensureConnection(): PiConnection {
 		if (!this.connection) {
-			this.logDebug("Creating Pi RPC connection...");
+			const extraArgs = this.plugin.settings.extraCliArgs;
+			const argsMsg = extraArgs ? ` with extra args: ${extraArgs}` : "";
+			this.logDebug(`Creating Pi RPC connection (spawning pi --mode rpc${argsMsg})...`);
 			this.connection = this.plugin.getConnection();
 
 			this.connection.onEvent((event) => this.handleRpcEvent(event));
-			this.logDebug("Pi RPC connection object created and event listener attached");
+			this.logDebug("Pi RPC connection object created and event listener attached. Any auth plugins installed via 'pi install' should be loaded by Pi automatically.");
+
+			// Automatically query available models + current state after connecting.
+			setTimeout(async () => {
+				try {
+					// Get available models
+					const modelsResponse = await this.connection!.getAvailableModels();
+					const modelsData = (modelsResponse as any).data || modelsResponse;
+					const rawModels = modelsData?.models || [];
+
+					this.availableModels = rawModels.map((m: any) => ({
+						id: m.id || m.name,
+						provider: m.provider,
+						name: m.name || m.id,
+					}));
+
+					const modelNames = this.availableModels.map(m => m.id).join(", ");
+					this.logDebug(`Available models from Pi: ${modelNames || "(none)"}`);
+
+					// Get current state
+					const stateResponse = await this.connection!.getState();
+					const state = (stateResponse as any).data || {};
+					const currentModel = state.model?.id || state.model?.name || "";
+					const currentProvider = state.model?.provider || "";
+
+					this.currentModel = currentModel;
+					this.currentProvider = currentProvider;
+					this.updateModelDisplay();
+
+					this.logDebug(`Current model: ${currentProvider ? currentProvider + " / " : ""}${currentModel || "(none)"}`);
+
+					// Auto-apply preferred model if configured
+					const settings = this.plugin.settings;
+					if (settings.autoSetModelOnConnect && (settings.preferredModel || settings.preferredProvider)) {
+						const prefModel = (settings.preferredModel || "").trim();
+						const prefProv = (settings.preferredProvider || "").trim();
+
+						// Resolve using the actual model entry reported by Pi so we send the exact provider
+						// value (if any) that Pi associated with that model ID. This is required for many
+						// routed models whose IDs contain "/" (e.g. OpenRouter free models).
+						let targetEntry = this.availableModels.find(m => m.id === prefModel);
+
+						// If user only set a preferred provider (no specific model), pick first available from it
+						if (!targetEntry && prefProv && !prefModel) {
+							targetEntry = this.availableModels.find(m => m.provider === prefProv);
+						}
+
+						if (targetEntry) {
+							const tModel = targetEntry.id;
+							const tProv = targetEntry.provider || undefined;
+
+							if (tModel !== currentModel || tProv !== currentProvider) {
+								const logProvider = tProv || "(auto)";
+								this.logDebug(`Auto-switching to preferred model: ${logProvider}/${tModel}`);
+								try {
+									await this.connection!.setModel(tProv, tModel);
+									this.currentModel = tModel;
+									this.currentProvider = tProv || "";
+									this.updateModelDisplay();
+									this.logDebug(`Successfully switched to ${logProvider}/${tModel}`);
+
+									// Re-fetch state to confirm Pi actually accepted the model (catches silent fallbacks)
+									try {
+										const confirmResp = await this.connection!.getState();
+										const confirmed = (confirmResp as any).data?.model || {};
+										const cModel = confirmed.id || confirmed.name || "";
+										const cProv = confirmed.provider || "";
+										if (cModel && (cModel !== tModel || cProv !== (tProv || ""))) {
+											this.logDebug(`After switch, Pi now reports: ${cProv ? cProv + "/" : ""}${cModel}`, true);
+										}
+									} catch {}
+								} catch (err) {
+									this.logDebug(`Failed to set preferred model: ${err instanceof Error ? err.message : err}`, true);
+								}
+							}
+						} else if (prefModel) {
+							const hint = this.availableModels.length > 0
+								? ` (first few available: ${this.availableModels.slice(0, 3).map(m => m.id).join(", ")})`
+								: "";
+							this.logDebug(`Preferred model "${prefModel}" not found in Pi's available models${hint}. Skipping auto-switch.`, true);
+						}
+					}
+
+					// Loud warning if xai-auth is missing (user's Grok Heavy auth package)
+					const hasXaiAuth = this.availableModels.some(m => m.id === "xai-auth" || m.provider === "xai-auth");
+					if (!hasXaiAuth) {
+						this.logDebug("⚠️ 'xai-auth' provider not found in available models. The pi-xai-oauth package did not register. Your Grok Heavy credentials may not be available in this session.", true);
+					}
+				} catch (e) {
+					this.logDebug(`Failed to query Pi state/models: ${e instanceof Error ? e.message : e}`, true);
+				}
+			}, 900);
 		}
 		return this.connection;
 	}
@@ -291,6 +426,24 @@ export class PiChatView extends ItemView {
 			this.logDebug(`RPC event: ${event.type} (role=${role || "?"}) content=${hasText}`);
 		} else if (event.type === "stderr") {
 			this.logDebug(`[stderr] ${(event as any).line}`, true);
+		} else if (event.type === "spawn_info") {
+			const info = event as any;
+			if (info.command) this.logDebug(`Spawn command: ${info.command}`);
+			if (info.cwd) this.logDebug(`Working dir: ${info.cwd}`);
+			if (info.detectedAuthKeys && info.detectedAuthKeys.length > 0) {
+				this.logDebug(`Detected auth-related keys: ${info.detectedAuthKeys.join(", ")}`);
+			}
+			if (info.note) {
+				this.logDebug(info.note);
+			}
+		} else if (event.type === "response") {
+			const cmd = (event as any).command;
+			if (cmd === "get_available_models") {
+				const modelCount = (event as any).data?.models?.length ?? 0;
+				this.logDebug(`Response to get_available_models: ${modelCount} model(s) returned`);
+			} else {
+				this.logDebug(`RPC response for command: ${cmd || "(unknown)"}`);
+			}
 		} else {
 			this.logDebug(`RPC event: ${event.type}`);
 		}
@@ -373,6 +526,16 @@ export class PiChatView extends ItemView {
 				this.updateStatus("Ready");
 				break;
 
+			case "auto_retry_start":
+				this.logDebug("Pi is auto-retrying the model call (often due to rate limits or empty response from upstream)", true);
+				this.updateStatus("Retrying...");
+				break;
+
+			case "auto_retry_end":
+				this.logDebug("Pi auto-retry sequence ended");
+				this.updateStatus("Ready");
+				break;
+
 			case "message_end": {
 				// Some Pi responses deliver the full assistant message here instead of (or in addition to) deltas
 				const msg = (event as any).message;
@@ -399,6 +562,9 @@ export class PiChatView extends ItemView {
 						const { body } = this.addMessage(this.currentAssistantMessage);
 						MarkdownRenderer.render(this.app, text, body, "", new Component());
 						this.logDebug("Created and rendered message from message_end (no prior deltas)");
+					} else {
+						// Assistant message arrived but contained no usable text (common with rate-limited free OpenRouter models)
+						this.logDebug("Assistant message_end arrived with empty content — upstream model returned nothing (rate limit, auth, or model error likely)", true);
 					}
 				}
 				break;

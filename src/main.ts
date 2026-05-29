@@ -40,6 +40,36 @@ export default class PiPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "pi-switch-model",
+			name: "Pi: Switch model",
+			callback: async () => {
+				const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_PI_CHAT);
+				const view = leaves[0]?.view as any;
+
+				if (!view || !view.availableModels || view.availableModels.length === 0) {
+					new Notice("Open the Pi chat view and wait for models to load first.");
+					return;
+				}
+
+				// Simple implementation: cycle through available models for now
+				const models = view.availableModels;
+				const currentIndex = models.findIndex((m: any) => m.id === view.currentModel);
+				const nextIndex = (currentIndex + 1) % models.length;
+				const next = models[nextIndex];
+
+				try {
+					await view.connection?.setModel(next.provider, next.id);
+					view.currentModel = next.id;
+					view.currentProvider = next.provider || "";
+					view.updateModelDisplay?.();
+					new Notice(`Switched to ${next.provider ? next.provider + " / " : ""}${next.id}`);
+				} catch (e) {
+					new Notice("Failed to switch model: " + (e instanceof Error ? e.message : e));
+				}
+			},
+		});
+
 		// Settings tab
 		this.addSettingTab(new PiSettingTab(this.app, this));
 
@@ -74,9 +104,28 @@ export default class PiPlugin extends Plugin {
 
 		const cwd = this.resolveWorkingDirectory();
 
+		// Parse extra CLI args (space separated)
+		let extraArgs = this.settings.extraCliArgs
+			? this.settings.extraCliArgs.split(/\s+/).filter(Boolean)
+			: [];
+
+		// Automatically inject --verbose if the toggle is enabled
+		if (this.settings.verboseMode && !extraArgs.includes("--verbose")) {
+			extraArgs = ["--verbose", ...extraArgs];
+		}
+
+		// Build apiKeys object — this gets merged into the child process env
+		const apiKeys: Record<string, string> = {};
+
+		if (this.settings.openrouterApiKey) {
+			apiKeys["OPENROUTER_API_KEY"] = this.settings.openrouterApiKey;
+		}
+
 		this.connection = new PiConnection({
 			piBinaryPath: this.settings.piBinaryPath,
 			cwd,
+			extraArgs,
+			apiKeys,
 		});
 
 		try {
