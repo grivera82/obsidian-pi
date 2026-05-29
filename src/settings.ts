@@ -13,13 +13,14 @@ export interface PiPluginSettings {
 	preferredModel: string;      // e.g. "grok-4.3"
 	autoSetModelOnConnect: boolean;
 
+	// Additional provider API keys (injected into the Pi process environment)
+	xiaomiMimoApiKey: string; // XIAOMI_MIMO_API_KEY for pi-mimo-provider etc.
+	openrouterApiKey: string; // OPENROUTER_API_KEY for OpenRouter routing / many models
+
 	// Advanced
 	extraCliArgs: string; // space-separated extra arguments passed to `pi --mode rpc`
 	verboseMode: boolean; // if true, automatically adds --verbose to the spawn command
 	ttyEmulation: boolean; // wrap spawn with `script` to emulate a TTY (can help some auth packages)
-
-	// Direct key support (convenience for testing other providers like OpenRouter)
-	openrouterApiKey: string;
 }
 
 export const DEFAULT_SETTINGS: PiPluginSettings = {
@@ -30,15 +31,15 @@ export const DEFAULT_SETTINGS: PiPluginSettings = {
 	chatSaveFolder: "Pi Chats",
 
 	preferredProvider: "",
-	preferredModel: "",
+	preferredModel: "grok-4.3",
 	autoSetModelOnConnect: true,
+
+	xiaomiMimoApiKey: "",
+	openrouterApiKey: "",
 
 	extraCliArgs: "",
 	verboseMode: false,
-	ttyEmulation: false,
-
-	// Direct key support (convenience for testing other providers)
-	openrouterApiKey: "",
+	ttyEmulation: true,
 };
 
 export class PiSettingTab extends PluginSettingTab {
@@ -143,7 +144,7 @@ export class PiSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Preferred model")
-			.setDesc("Model ID to auto-switch to on connect. For routed models (e.g. OpenRouter), paste the full ID shown in the model list such as 'meta-llama/llama-3.3-70b-instruct:free'. Preferred provider may be left blank for these.")
+			.setDesc("Model ID to auto-switch to on connect (e.g. 'grok-4.3' or 'grok-4.3-latest'). Leave blank to stay on whatever the pi CLI starts with.")
 			.addText((text) =>
 				text
 					.setPlaceholder("grok-4.3")
@@ -165,6 +166,41 @@ export class PiSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		containerEl.createEl("h3", { text: "Additional API Keys" });
+
+		const mimoKeySetting = new Setting(containerEl)
+			.setName("Xiaomi MiMo API Key")
+			.setDesc("Your Xiaomi MiMo key (sk-... or tp-...). IMPORTANT: This only sends the key to Pi. You must ALSO install + register the 'pi-mimo-provider' package in your Pi environment (see README). Without the provider package, no MiMo models will appear.");
+
+		mimoKeySetting.addText((text) => {
+			text
+				.setPlaceholder("sk-... or tp-...")
+				.setValue(this.plugin.settings.xiaomiMimoApiKey || "")
+				.onChange(async (value) => {
+					this.plugin.settings.xiaomiMimoApiKey = value.trim();
+					await this.plugin.saveSettings();
+				});
+			// Use password input for the key
+			text.inputEl.type = "password";
+			text.inputEl.style.width = "100%";
+		});
+
+		const openrouterKeySetting = new Setting(containerEl)
+			.setName("OpenRouter API Key")
+			.setDesc("API key for OpenRouter (supports 100+ models from many providers through one key). Injected as OPENROUTER_API_KEY.");
+
+		openrouterKeySetting.addText((text) => {
+			text
+				.setPlaceholder("sk-or-...")
+				.setValue(this.plugin.settings.openrouterApiKey || "")
+				.onChange(async (value) => {
+					this.plugin.settings.openrouterApiKey = value.trim();
+					await this.plugin.saveSettings();
+				});
+			text.inputEl.type = "password";
+			text.inputEl.style.width = "100%";
+		});
 
 		new Setting(containerEl)
 			.setName("Extra CLI arguments")
@@ -193,25 +229,12 @@ export class PiSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("TTY emulation (macOS)")
-			.setDesc("Wraps the Pi process with `script` to simulate a real terminal. This can help some auth packages (like pi-xai-oauth) that behave differently without a TTY. Only works on macOS.")
+			.setDesc("Wraps the Pi process with `script` to simulate a real terminal. Enable this if your Grok auth (via pi-xai-oauth or similar) does not work from the plugin but works in your terminal.")
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.ttyEmulation)
 					.onChange(async (value) => {
 						this.plugin.settings.ttyEmulation = value;
-						await this.plugin.saveSettings();
-					})
-			);
-
-		new Setting(containerEl)
-			.setName("OpenRouter API Key (optional)")
-			.setDesc("Paste your OpenRouter key here for easy testing of other models. Injected as OPENROUTER_API_KEY on spawn. Note: free-tier OpenRouter models (:free) often have very low rate limits and may return empty responses or trigger retries.")
-			.addText((text) =>
-				text
-					.setPlaceholder("sk-or-...")
-					.setValue(this.plugin.settings.openrouterApiKey)
-					.onChange(async (value) => {
-						this.plugin.settings.openrouterApiKey = value.trim();
 						await this.plugin.saveSettings();
 					})
 			);

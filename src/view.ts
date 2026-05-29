@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, Notice, MarkdownRenderer, Component } from "obsidian";
+import { ItemView, WorkspaceLeaf, Notice, MarkdownRenderer, Component, FuzzySuggestModal, App } from "obsidian";
 import PiPlugin from "./main";
 import { PiConnection, RpcEvent, MessageUpdateEvent } from "./rpc";
 
@@ -8,6 +8,45 @@ interface ChatMessage {
 	role: "user" | "assistant" | "thinking" | "tool";
 	content: string;
 	toolName?: string;
+}
+
+// Lightweight type for models reported by Pi
+export interface PiModel {
+	id: string;
+	provider?: string;
+	name?: string;
+}
+
+class ModelSuggestModal extends FuzzySuggestModal<PiModel> {
+	private models: PiModel[];
+	private onChooseCallback: (model: PiModel) => void;
+
+	constructor(app: App, models: PiModel[], onChoose: (model: PiModel) => void) {
+		super(app);
+		this.models = models;
+		this.onChooseCallback = onChoose;
+		this.setPlaceholder("Search models (e.g. grok, claude, qwen, openrouter...)");
+		this.setInstructions([
+			{ command: "↑↓", purpose: "Navigate" },
+			{ command: "↵", purpose: "Select model" },
+			{ command: "esc", purpose: "Cancel" },
+		]);
+	}
+
+	getItems(): PiModel[] {
+		return this.models;
+	}
+
+	getItemText(model: PiModel): string {
+		if (model.provider) {
+			return `${model.provider} / ${model.id}`;
+		}
+		return model.id;
+	}
+
+	onChooseItem(model: PiModel, evt: MouseEvent | KeyboardEvent): void {
+		this.onChooseCallback(model);
+	}
 }
 
 export class PiChatView extends ItemView {
@@ -28,7 +67,7 @@ export class PiChatView extends ItemView {
 	private debugLogs: string[] = [];
 
 	// Model state
-	private availableModels: Array<{ id: string; provider?: string; name?: string }> = [];
+	private availableModels: PiModel[] = [];
 	private currentModel: string = "";
 	private currentProvider: string = "";
 
@@ -37,6 +76,7 @@ export class PiChatView extends ItemView {
 	private currentAssistantMessage: ChatMessage | null = null;
 	private currentAssistantContainer: HTMLElement | null = null;
 	private currentAssistantRaw = "";
+	private assistantTurnFinalized = false;
 
 	constructor(leaf: WorkspaceLeaf, plugin: PiPlugin) {
 		super(leaf);
@@ -65,7 +105,7 @@ export class PiChatView extends ItemView {
 
 		// Current model display (clickable)
 		this.modelEl = header.createDiv({ cls: "pi-chat-model", text: "No model" });
-		this.modelEl.onclick = () => this.showModelSwitcher();
+		this.modelEl.onclick = () => this.openModelPicker();
 
 		this.statusEl = header.createDiv({ cls: "pi-chat-status", text: "Disconnected" });
 
@@ -171,30 +211,95 @@ export class PiChatView extends ItemView {
 			const display = this.currentProvider 
 				? `${this.currentProvider} / ${this.currentModel || "?"}`
 				: (this.currentModel || "No model");
-			this.modelEl.setText(display);
+			this.modelEl.setText(display + " ▾");
 			this.modelEl.title = "Click to switch model";
 		}
 	}
 
-	private async showModelSwitcher() {
-		if (!this.connection || this.availableModels.length === 0) {
-			new Notice("No models available yet. Wait for connection or send a message first.");
+	/**
+	 * Checks for common situations where the user configured an API key in the plugin
+	 * but the corresponding provider package is not loaded inside Pi.
+	 */
+	private runExternalProviderDiagnostics() {
+		const settings = this.plugin.settings;
+
+		// Xiaomi MiMo
+		const hasMimoKey = !!settings.xiaomiMimoApiKey?.trim();
+		const hasMimoModels = this.availableModels.some(m =>
+			/mimo/i.test(m.id) || /mimo/i.test(m.provider || "")
+		);
+
+		if (hasMimoKey && !hasMimoModels) {
+			this.logDebug("⚠️ Xiaomi MiMo API key is set in plugin settings, but no MiMo models were reported by Pi.", true);
+			this.logDebug("This is very common. The key was sent, but Pi needs the provider package too.", true);
+			this.logDebug("", true);
+			this.logDebug("Fix steps (run in your normal terminal):", true);
+			this.logDebug("1. Install the provider:", true);
+			this.logDebug("     bun add pi-mimo-provider", true);
+			this.logDebug("     (or npm / pnpm — see https://github.com/agustif/pi-mimo-provider)", true);
+			this.logDebug("2. Register it (add to ~/.pi/agent/settings.json packages or use --extension).", true);
+			this.logDebug("3. Come back here, close the Pi chat view completely, then reopen it.", true);
+			this.logDebug("4. Check this debug panel again — you should see mimo-v2.5-pro etc. in the model list.", true);
+		}
+
+		// OpenRouter (lighter check — many people get this via built-in or other means)
+		const hasOpenrouterKey = !!settings.openrouterApiKey?.trim();
+		const hasOpenrouterModels = this.availableModels.some(m =>
+			/openrouter/i.test(m.id) || /openrouter/i.test(m.provider || "")
+		);
+
+		if (hasOpenrouterKey && !hasOpenrouterModels && this.availableModels.length > 0) {
+			this.logDebug("Note: OpenRouter API key is set, but no 'openrouter/...' models appeared.", true);
+			this.logDebug("You may still need to configure OpenRouter in your Pi setup (models.json or a provider package).", true);
+		}
+	}
+
+	public async openModelPicker() {
+		if (!this.connection) {
+			new Notice("Pi is not connected yet. Send a message first to start a session.");
 			return;
 		}
 
-		// Simple model switcher using prompts for now (can be improved later)
-		const options = this.availableModels.map(m => ({
-			label: m.provider ? `${m.provider} / ${m.id}` : m.id,
-			value: m
-		}));
+		if (this.availableModels.length === 0) {
+			new Notice("No models reported yet. Trying to refresh...");
+			try {
+				const resp = await this.connection.getAvailableModels();
+				const data = (resp as any).data || resp;
+				const raw = data?.models || [];
+				this.availableModels = raw.map((m: any) => ({
+					id: m.id || m.name,
+					provider: m.provider,
+					name: m.name || m.id,
+				})) as PiModel[];
+			} catch (e) {
+				new Notice("Could not load models from Pi.");
+				return;
+			}
+		}
 
-		// For a quick implementation, we'll use a basic approach:
-		// Show a notice with instructions + add a proper command for switching.
-		const current = this.currentProvider 
-			? `${this.currentProvider}/${this.currentModel}` 
-			: this.currentModel;
+		if (this.availableModels.length === 0) {
+			new Notice("Pi did not return any models. Check the debug panel for details.");
+			return;
+		}
 
-		new Notice(`Current: ${current}\nUse Command Palette → "Pi: Switch model" to change.`, 6000);
+		const modal = new ModelSuggestModal(this.app, this.availableModels, async (chosen) => {
+			try {
+				await this.connection!.setModel(chosen.provider, chosen.id);
+				this.currentModel = chosen.id;
+				this.currentProvider = chosen.provider || "";
+				this.updateModelDisplay();
+
+				const display = this.currentProvider 
+					? `${this.currentProvider} / ${this.currentModel}`
+					: this.currentModel;
+				new Notice(`Switched to ${display}`);
+			} catch (e) {
+				const msg = e instanceof Error ? e.message : String(e);
+				new Notice(`Failed to switch model: ${msg}`);
+			}
+		});
+
+		modal.open();
 	}
 
 	private logDebug(message: string, isError = false) {
@@ -228,7 +333,7 @@ export class PiChatView extends ItemView {
 			this.connection = this.plugin.getConnection();
 
 			this.connection.onEvent((event) => this.handleRpcEvent(event));
-			this.logDebug("Pi RPC connection object created and event listener attached. Any auth plugins installed via 'pi install' should be loaded by Pi automatically.");
+			this.logDebug("Pi RPC connection object created. The plugin is attempting to run your `pi` CLI with as much of your normal terminal environment as possible (login shell + TTY emulation on macOS).");
 
 			// Automatically query available models + current state after connecting.
 			setTimeout(async () => {
@@ -242,10 +347,13 @@ export class PiChatView extends ItemView {
 						id: m.id || m.name,
 						provider: m.provider,
 						name: m.name || m.id,
-					}));
+					})) as PiModel[];
 
 					const modelNames = this.availableModels.map(m => m.id).join(", ");
 					this.logDebug(`Available models from Pi: ${modelNames || "(none)"}`);
+
+					// Smart diagnostics for common external providers
+					this.runExternalProviderDiagnostics();
 
 					// Get current state
 					const stateResponse = await this.connection!.getState();
@@ -267,7 +375,7 @@ export class PiChatView extends ItemView {
 
 						// Resolve using the actual model entry reported by Pi so we send the exact provider
 						// value (if any) that Pi associated with that model ID. This is required for many
-						// routed models whose IDs contain "/" (e.g. OpenRouter free models).
+						// routed models whose IDs contain "/" (e.g. some providers expose namespaced model IDs).
 						let targetEntry = this.availableModels.find(m => m.id === prefModel);
 
 						// If user only set a preferred provider (no specific model), pick first available from it
@@ -314,7 +422,11 @@ export class PiChatView extends ItemView {
 					// Loud warning if xai-auth is missing (user's Grok Heavy auth package)
 					const hasXaiAuth = this.availableModels.some(m => m.id === "xai-auth" || m.provider === "xai-auth");
 					if (!hasXaiAuth) {
-						this.logDebug("⚠️ 'xai-auth' provider not found in available models. The pi-xai-oauth package did not register. Your Grok Heavy credentials may not be available in this session.", true);
+						this.logDebug("⚠️ 'xai-auth' provider not found. The pi-xai-oauth package did not load. This usually means the plugin couldn't fully inherit your terminal environment.", true);
+						this.logDebug("Recommended fixes:", true);
+						this.logDebug("1. In plugin settings, set 'Pi binary path' to the FULL output of `which pi` from your terminal (not just 'pi').", true);
+						this.logDebug("2. Make sure TTY emulation is enabled, then fully quit and restart Obsidian.", true);
+						this.logDebug("3. Confirm `pi` uses Grok normally when you run it directly in Terminal.", true);
 					}
 				} catch (e) {
 					this.logDebug(`Failed to query Pi state/models: ${e instanceof Error ? e.message : e}`, true);
@@ -328,6 +440,8 @@ export class PiChatView extends ItemView {
 		const text = this.inputEl.value.trim();
 		if (!text || this.isStreaming) return;
 
+		this.assistantTurnFinalized = false;
+		this.resetAssistantStreamingState();
 		this.addMessage({ role: "user", content: text });
 		this.inputEl.value = "";
 
@@ -347,6 +461,7 @@ export class PiChatView extends ItemView {
 			const msg = err instanceof Error ? err.message : String(err);
 			this.logDebug(`Failed to send prompt: ${msg}`, true);
 			this.isStreaming = false;
+			this.resetAssistantStreamingState();
 			this.updateButtons();
 			this.updateStatus("Error");
 			new Notice(`Pi error: ${msg}`);
@@ -368,6 +483,8 @@ export class PiChatView extends ItemView {
 
 	/** Public API so main.ts can send contextual prompts */
 	async sendPrompt(prompt: string) {
+		this.assistantTurnFinalized = false;
+		this.resetAssistantStreamingState();
 		this.addMessage({ role: "user", content: prompt });
 
 		this.isStreaming = true;
@@ -383,10 +500,19 @@ export class PiChatView extends ItemView {
 			const msg = err instanceof Error ? err.message : String(err);
 			this.logDebug(`[context] Failed: ${msg}`, true);
 			this.isStreaming = false;
+			this.resetAssistantStreamingState();
 			this.updateButtons();
 			this.updateStatus("Error");
 			new Notice(`Pi error: ${msg}`);
 		}
+	}
+
+	private resetAssistantStreamingState() {
+		this.currentAssistantMessage = null;
+		this.currentAssistantContainer = null;
+		this.currentAssistantRaw = "";
+		// Intentionally does NOT touch assistantTurnFinalized.
+		// The flag must survive end-of-stream cleanup so message_end can see it.
 	}
 
 	private addMessage(msg: ChatMessage) {
@@ -428,10 +554,14 @@ export class PiChatView extends ItemView {
 			this.logDebug(`[stderr] ${(event as any).line}`, true);
 		} else if (event.type === "spawn_info") {
 			const info = event as any;
-			if (info.command) this.logDebug(`Spawn command: ${info.command}`);
+			if (info.command) this.logDebug(`Spawn command (logical): ${info.command}`);
+			if (info.actualCommand) this.logDebug(`Actual executed command: ${info.actualCommand}`);
 			if (info.cwd) this.logDebug(`Working dir: ${info.cwd}`);
 			if (info.detectedAuthKeys && info.detectedAuthKeys.length > 0) {
 				this.logDebug(`Detected auth-related keys: ${info.detectedAuthKeys.join(", ")}`);
+			}
+			if (info.grokRelatedKeys && info.grokRelatedKeys.length > 0) {
+				this.logDebug(`Grok / xAI related env vars detected: ${info.grokRelatedKeys.join(", ")}`);
 			}
 			if (info.note) {
 				this.logDebug(info.note);
@@ -466,6 +596,7 @@ export class PiChatView extends ItemView {
 						const { body } = this.addMessage(this.currentAssistantMessage);
 						this.currentAssistantContainer = body;
 						this.currentAssistantRaw = "";
+						this.logDebug("Assistant streaming started (first text delta)");
 					}
 
 					if (delta.delta) {
@@ -492,12 +623,12 @@ export class PiChatView extends ItemView {
 						);
 					}
 
-					this.currentAssistantMessage = null;
-					this.currentAssistantContainer = null;
-					this.currentAssistantRaw = "";
+					this.assistantTurnFinalized = true;
+					this.resetAssistantStreamingState(); // clears transient streaming fields only
 					this.isStreaming = false;
 					this.updateButtons();
 					this.updateStatus("Ready");
+					this.logDebug("Assistant response finalized via streaming (text_end/done)");
 				}
 				break;
 			}
@@ -522,6 +653,8 @@ export class PiChatView extends ItemView {
 
 			case "agent_end":
 				this.isStreaming = false;
+				this.assistantTurnFinalized = true;
+				this.resetAssistantStreamingState(); // safe: no longer clears the finalized flag
 				this.updateButtons();
 				this.updateStatus("Ready");
 				break;
@@ -553,17 +686,46 @@ export class PiChatView extends ItemView {
 					}
 
 					if (text && this.currentAssistantContainer) {
+						// Streaming container still open — render into it (message_end arrived before text_end)
 						this.currentAssistantContainer.empty();
 						MarkdownRenderer.render(this.app, text, this.currentAssistantContainer, "", new Component());
-						this.logDebug("Rendered full message from message_end event");
+						this.logDebug("Rendered full message from message_end event (into open streaming container)");
+						this.assistantTurnFinalized = true;
+						// Clean up streaming state since message_end is acting as the finalizer
+						this.currentAssistantMessage = null;
+						this.currentAssistantContainer = null;
+						this.currentAssistantRaw = "";
+						this.isStreaming = false;
+						this.updateButtons();
+						this.updateStatus("Ready");
 					} else if (text) {
-						// No streaming container existed — create one now
-						this.currentAssistantMessage = { role: "assistant", content: text };
-						const { body } = this.addMessage(this.currentAssistantMessage);
-						MarkdownRenderer.render(this.app, text, body, "", new Component());
-						this.logDebug("Created and rendered message from message_end (no prior deltas)");
+						// No open streaming container. Guard against duplicate using the explicit turn flag
+						// (preferred) + a fallback check on the messages array for safety.
+						if (this.assistantTurnFinalized) {
+							this.logDebug("message_end arrived with full content, but assistant response already finalized this turn — skipping duplicate");
+						} else {
+							// Secondary safety check. Note: for messages created via the streaming path,
+							// the ChatMessage object in the array often has content="" because we render
+							// to the live DOM element instead of mutating the model object.
+							const last = this.messages[this.messages.length - 1];
+							const alreadyHaveAssistant = last && last.role === "assistant";
+							if (alreadyHaveAssistant) {
+								this.logDebug("message_end arrived with full content, but an assistant message already exists in the turn — skipping duplicate");
+								this.assistantTurnFinalized = true;
+							} else {
+								this.currentAssistantMessage = { role: "assistant", content: text };
+								const { body } = this.addMessage(this.currentAssistantMessage);
+								MarkdownRenderer.render(this.app, text, body, "", new Component());
+								this.logDebug("Created assistant message from message_end fallback (streaming path did not leave a live container)");
+								this.assistantTurnFinalized = true;
+							}
+						}
+						// Ensure streaming state is cleaned up in the "instead of deltas" scenario
+						this.isStreaming = false;
+						this.updateButtons();
+						this.updateStatus("Ready");
 					} else {
-						// Assistant message arrived but contained no usable text (common with rate-limited free OpenRouter models)
+						// Assistant message arrived but contained no usable text (common when the upstream model is rate-limited or returns empty)
 						this.logDebug("Assistant message_end arrived with empty content — upstream model returned nothing (rate limit, auth, or model error likely)", true);
 					}
 				}
@@ -572,6 +734,7 @@ export class PiChatView extends ItemView {
 
 			case "error":
 				this.isStreaming = false;
+				this.resetAssistantStreamingState();
 				this.updateButtons();
 				this.updateStatus("Error");
 				new Notice(`Pi: ${event.error || "Unknown error"}`);

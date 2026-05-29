@@ -1,7 +1,7 @@
 {
 	"name": "obsidian-pi",
 	"version": "0.1.0",
-	"description": "Chat with the Pi coding agent inside Obsidian to create, modify, and organize notes.",
+	"description": "Chat with Pi or Grok models inside Obsidian using the pi CLI for rich agentic workflows and note creation.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

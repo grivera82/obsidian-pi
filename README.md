@@ -1,62 +1,128 @@
 # Obsidian Pi
 
-Chat with the [Pi coding agent](https://pi.dev/) directly inside Obsidian.
+Chat with **Pi** (or **Grok** models through the pi CLI) directly inside Obsidian.
 
-Talk to Pi to create notes, edit content, organize your vault, generate MOCs, refactor structure, answer questions about your notes, and more — all through a beautiful native-feeling sidebar chat.
+Use the powerful `pi` CLI agent inside your vault for note creation, editing, refactoring, tool use, and reasoning — with excellent support for Grok models (grok-build, grok-4.3, etc.).
 
-> **Desktop only.** Requires the Pi CLI to be installed (`npm i -g @earendil-works/pi-coding-agent`).
+This plugin gives you a native-feeling sidebar chat with full streaming, thinking visibility, tool call transparency, and model switching.
 
-## Features (Planned / In Progress)
+> **Desktop only.** Requires the `pi` CLI.
 
-- Full streaming chat with Pi in a sidebar view
-- Native Obsidian Markdown rendering (callouts, wikilinks, Mermaid, math, code highlighting)
-- Thinking blocks and collapsible tool results
-- Easy context: current note, selection, active search
-- Session management backed by Pi's native tree sessions
-- One-click actions to insert responses or apply edits to your notes
-- Model switching, thinking level control
-- Status bar with token usage and cost
+## Why use this with Grok?
+
+The `pi` CLI has excellent support for Grok models (via providers like `grok-build` and `xai-auth`). This plugin includes robust model auto-switching, good debug logging, and reliable streaming — often better than direct headless modes for agentic workflows.
 
 ## Installation
 
-### 1. Install the Pi CLI
+### 1. Install / Update the Pi CLI
 
-```bash
-npm install -g @earendil-works/pi-coding-agent
-```
+Make sure you have the `pi` command available and that it can access Grok models (e.g. via `pi models` or your auth setup).
 
-or use the official installer:
+### 2. The Plugin
 
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
+The plugin is already set up via symlinks in your vault (pointing to this project).
 
-### 2. Install the Plugin
+**To enable it:**
 
-**Recommended (Community Plugins):**
+1. In Obsidian → **Settings → Community plugins**
+2. Disable the "Grok" plugin (if you previously installed the experimental obsidian-grok version)
+3. Enable **"Pi"**
+4. Reload if necessary
 
-- Once published, search for **"Pi"** in Obsidian → Community Plugins.
+### 3. Recommended Settings for Grok
 
-**Manual / Development Install:**
+In the Pi plugin settings:
 
-1. Download the latest release from the [Releases page](https://github.com/grivera82/obsidian-pi/releases).
-2. Extract `main.js`, `styles.css`, and `manifest.json` into:
-   ```
-   YourVault/.obsidian/plugins/obsidian-pi/
-   ```
-3. Reload Obsidian and enable the plugin in **Settings → Community Plugins**.
-   - Enable "Pi" in Community Plugins
+- **Pi binary path**: `pi` (or full path to your pi binary)
+- **Preferred model**: `grok-4.3` (or `grok-4.3-latest`, `grok-build`, etc. — use whatever your `pi` lists)
+- **Auto-switch model on connect**: On
 
-3. Configure the path to the `pi` binary and your vault working directory in plugin settings.
+This will automatically switch to your preferred Grok model when you open the chat.
 
 ## Development
 
 ```bash
-npm install
+cd ~/Projects/obsidian-pi
 npm run dev
 ```
 
-See the [Pi RPC documentation](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/docs/rpc.md) for protocol details.
+Changes to `main.js` are immediately live because of the symlinks in your vault.
+
+## Key Features
+
+- Rich streaming with thinking blocks
+- Tool execution visibility
+- Clickable model picker in the chat header (fuzzy search across all providers Pi knows about)
+- Reliable model switching (including auto-switch on connect)
+- Excellent debug panel for troubleshooting Grok + pi connections (now also shows exactly when duplicate renders from the pi event stream are prevented)
+- Works great with Grok via the pi CLI's native auth (e.g. `pi-xai-oauth`) — no extra keys needed in the plugin
+
+**Recent reliability improvement**: The plugin now correctly handles the case where the underlying `pi` CLI sends *both* incremental streaming events (`message_update` with `text_delta`/`text_end`) *and* a later `message_end` event containing the full assistant message for the same turn. This previously caused the same response to appear twice for many users. The fix includes an explicit turn-finalization flag and much clearer debug logging when the plugin safely skips a duplicate render.
+
+## Authentication (Grok)
+
+The plugin does **not** manage Grok authentication. It just runs your already-configured `pi` CLI.
+
+Because Obsidian is a GUI app, it doesn't inherit your full terminal environment by default (especially on macOS). The plugin uses several techniques to work around this:
+
+- Runs `pi` through your login shell (`zsh -l` or your `$SHELL -l`)
+- Copies all `XAI_*`, `GROK_*`, and `PI_*` environment variables
+- TTY emulation is **enabled by default** (uses `script` wrapper)
+
+### If Grok auth doesn't work in the plugin but works in Terminal:
+
+1. Make sure TTY emulation is enabled in plugin settings (it is on by default now).
+2. Fully quit and restart Obsidian (important after changing the setting).
+3. Check the debug panel for "Detected auth-related keys" and "Grok / xAI related env vars".
+4. Confirm that `pi` can use Grok normally when you run it in your normal terminal.
+
+Common working setup: Install auth with `pi install pi-xai-oauth` (or equivalent) in Terminal, then the plugin should pick it up.
+
+## Using other providers (Xiaomi MiMo, OpenRouter, etc.)
+
+The plugin works with **any model/provider** that your `pi` CLI supports — not just Grok.
+
+### Xiaomi MiMo (MiMo-V2.5 series)
+
+**Two things are required** — the key alone is not enough.
+
+1. **Install + register the provider package in Pi** (do this in your normal terminal first):
+   ```bash
+   bun add pi-mimo-provider
+   ```
+   Then register it (usually by adding to `~/.pi/agent/settings.json` under `packages`, or via `--extension`). See the [pi-mimo-provider](https://github.com/agustif/pi-mimo-provider) repo for exact steps.
+
+2. **Give the plugin your API key** (so it reaches the Pi process reliably on macOS):
+   - Best: Paste it into **Settings → Community plugins → Pi → Additional API Keys → Xiaomi MiMo API Key**
+   - Alternative: Set `XIAOMI_MIMO_API_KEY` in your shell and restart Obsidian.
+
+3. Open (or reopen) the Pi chat. The models (`mimo-v2.5-pro`, `mimo-v2.5`, etc.) should appear in the model picker.
+
+If you set the key but still don't see MiMo models, open the **debug panel** at the bottom of the chat view. The plugin now prints clear step-by-step instructions when it detects this exact situation.
+
+The plugin automatically injects the key as `XIAOMI_MIMO_API_KEY` (highest priority).
+
+### OpenRouter
+
+OpenRouter is one of the easiest ways to access 100+ models (including many Grok, Claude, GPT, Gemini, Llama, DeepSeek, Qwen, etc.) through a single key.
+
+1. Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+
+2. Provide the key **either**:
+   - Via environment variable:
+     ```bash
+     export OPENROUTER_API_KEY="sk-or-..."
+     ```
+   - **Or** (more reliable on macOS): Paste it into  
+     **Settings → Community plugins → Pi → Additional API Keys → OpenRouter API Key**
+
+3. In Pi, switch models to any OpenRouter-routed model (e.g. `openrouter/anthropic/claude-3.5-sonnet`, `openrouter/x-ai/grok-4`, `openrouter/qwen/qwen3-235b-a22b`, etc.). Many people use OpenRouter + Pi for easy model experimentation without installing separate provider packages.
+
+The plugin automatically detects `OPENROUTER_API_KEY` and `OPENROUTER_KEY` from your environment and injects any key entered in settings.
+
+## Notes
+
+If you were previously using the experimental `obsidian-grok` direct integration, you can safely disable it and use this plugin instead for a more mature experience with Grok models.
 
 ## License
 

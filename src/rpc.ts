@@ -180,17 +180,46 @@ export class PiConnection {
 			"FIREWORKS_API_KEY",
 			// Routing / aggregation
 			"OPENROUTER_API_KEY",
+			"OPENROUTER_KEY",
 			"TOGETHER_API_KEY",
 			"PERPLEXITY_API_KEY",
 			// Local / self-hosted
 			"OLLAMA_HOST",
 			"LMSTUDIO_API_KEY",
+			// Xiaomi MiMo (OpenAI-compatible via pi-mimo-provider etc.)
+			"XIAOMI_MIMO_API_KEY",
+			"MIMO_API_KEY",
+			"XIAOMI_API_KEY",
 			// Generic fallbacks some tools respect
 			"API_KEY",
 			"LLM_API_KEY",
 		];
 
 		for (const key of llmKeyNames) {
+			if (process.env[key]) {
+				env[key] = process.env[key]!;
+			}
+		}
+
+		// Copy any XAI_* or GROK_* variables from the parent environment.
+		// This is important because your pi CLI may use custom Grok/xAI auth
+		// variables or config that are not in the small hardcoded list above.
+		for (const [key, value] of Object.entries(process.env)) {
+			if ((key.startsWith("XAI_") || key.startsWith("GROK_")) && value) {
+				env[key] = value;
+			}
+		}
+
+		// Also copy common Node.js / npm related variables that can affect
+		// how `pi` discovers and loads auth plugins (like pi-xai-oauth).
+		const nodeRelated = [
+			"NODE_PATH",
+			"NPM_CONFIG_PREFIX",
+			"YARN_GLOBAL_FOLDER",
+			"PNPM_HOME",
+			"COREPACK_HOME",
+		];
+		for (const key of nodeRelated) {
 			if (process.env[key]) {
 				env[key] = process.env[key]!;
 			}
@@ -207,6 +236,12 @@ export class PiConnection {
 			k.startsWith("XAI_") ||
 			k.startsWith("GROK_")
 		);
+
+		// Also detect common Grok / xAI related things even if not keys
+		const grokRelated = Object.keys(env).filter(k =>
+			k.includes("GROK") || k.includes("XAI")
+		);
+
 		if (detectedAuthKeys.length > 0) {
 			console.log("[Pi RPC] Detected auth-related env keys:", detectedAuthKeys);
 		} else {
@@ -241,32 +276,59 @@ export class PiConnection {
 			}
 		}
 
+		let spawnCommand = this.options.piBinaryPath;
+		let spawnArgs = [...finalArgs];
+
+		// macOS GUI apps have a very stripped environment.
+		// We always prefer launching through the user's login shell so that
+		// their full PATH, nvm/Homebrew setup, and any auth configuration
+		// (including pi-xai-oauth) that makes `pi` work with Grok in Terminal
+		// is also available to the plugin.
+		if (process.platform === "darwin") {
+			const userShell = process.env.SHELL || "/bin/zsh";
+			const piCommand = `${this.options.piBinaryPath} ${finalArgs.join(" ")}`;
+
+			if (this.options.ttyEmulation) {
+				// script gives us a PTY (helps some auth flows) + login shell gives full env
+				spawnCommand = "script";
+				spawnArgs = ["-q", "/dev/null", userShell, "-l", "-c", piCommand];
+				console.log("[Pi RPC] Using script + login shell (best for Grok auth)");
+				this.dispatch({
+					type: "spawn_info",
+					command: `script -q /dev/null ${userShell} -l -c "${piCommand}"`,
+					cwd: this.options.cwd,
+					note: "Using login shell + TTY emulation for maximum environment compatibility with your Grok-configured pi",
+				});
+			} else {
+				// Login shell only (still much better than direct spawn)
+				spawnCommand = userShell;
+				spawnArgs = ["-l", "-c", piCommand];
+				console.log("[Pi RPC] Using login shell for environment");
+				this.dispatch({
+					type: "spawn_info",
+					command: `${userShell} -l -c "${piCommand}"`,
+					cwd: this.options.cwd,
+					note: "Login shell used to inherit your terminal environment for Grok auth",
+				});
+			}
+		} else if (this.options.ttyEmulation) {
+			spawnCommand = "script";
+			spawnArgs = ["-q", "/dev/null", this.options.piBinaryPath, ...finalArgs];
+		}
+
 		console.log("[Pi RPC] Spawning:", commandStr);
 		console.log("[Pi RPC] Working directory:", this.options.cwd);
+		console.log("[Pi RPC] Actual spawn argv:", [spawnCommand, ...spawnArgs]);
 
 		// Send spawn info to the debug panel
 		this.dispatch({
 			type: "spawn_info",
 			command: commandStr,
+			actualCommand: `${spawnCommand} ${spawnArgs.join(" ")}`,
 			cwd: this.options.cwd,
 			detectedAuthKeys,
+			grokRelatedKeys: grokRelated,
 		});
-
-		let spawnCommand = this.options.piBinaryPath;
-		let spawnArgs = [...finalArgs];
-
-		// TTY emulation on macOS using `script`
-		if (this.options.ttyEmulation && process.platform === "darwin") {
-			spawnCommand = "script";
-			spawnArgs = ["-q", "/dev/null", this.options.piBinaryPath, ...finalArgs];
-			console.log("[Pi RPC] Using TTY emulation via script");
-			this.dispatch({
-				type: "spawn_info",
-				command: `script -q /dev/null ${this.options.piBinaryPath} ${finalArgs.join(" ")}`,
-				cwd: this.options.cwd,
-				note: "TTY emulation enabled",
-			});
-		}
 
 		this.process = spawn(spawnCommand, spawnArgs, {
 			cwd: this.options.cwd,
